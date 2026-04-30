@@ -9,6 +9,7 @@ VPN Subscription Server for Render.com
 import os, json, base64, random, string, hashlib, uuid
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template_string, redirect
+from flask_cors import CORS
 from github import Github, Auth
 from github.GithubException import GithubException
 
@@ -18,6 +19,7 @@ REPO_NAME = "olegmmg/olegmmg.github.io"
 BRANCH = "main"
 
 app = Flask(__name__)
+CORS(app)
 
 # ========== GITHUB ==========
 github = None

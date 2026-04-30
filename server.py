@@ -82,8 +82,8 @@ def hash_password(password):
 
 # ========== ПАРАМЕТРЫ ==========
 TEMPLATES = {
-    "main": {"name": "Основная", "template_path": "vpn/sub", "output_dir": "vpn/subs"},
-    "test": {"name": "Тестовая", "template_path": "vpn/test", "output_dir": "vpn/tests"}
+    "main": {"name": "Основная", "template_path": "vpn/subN", "output_dir": "vpn/subs"},
+    "test": {"name": "Тестовая", "template_path": "vpn/testN", "output_dir": "vpn/tests"}
 }
 
 PRICES = {"main": {"7d": 0, "1m": 20, "3m": 50, "12m": 180}, "test": {"7d": 0, "1m": 30, "3m": 75, "12m": 270}}

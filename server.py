@@ -406,7 +406,7 @@ def admin():
             message = f"🔄 Синхронизация завершена!<br>📁 Основные: {results['main']}, Тестовые: {results['test']}"
             message_type = 'warning'
         
-        elif action == 'confirm_order':
+        if action == 'confirm_order':
             code = request.form.get('order_code')
             path = f"{ORDERS_DIR}/{code}.json"
             content = get_file_content(path)
@@ -566,7 +566,7 @@ ADMIN_TEMPLATE = '''
                             </td>
                         </tr>
                         {% else %}
-                        <tr><td colspan="7">Нет заявок</td></table>
+                        <tr><td colspan="7">Нет заявок</td></tr>
                         {% endfor %}
                     </tbody>
                 </table>

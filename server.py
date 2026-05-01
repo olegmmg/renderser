@@ -11,7 +11,6 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template_string, redirect
 from flask_cors import CORS
 from github import Github, Auth
-from github.GithubException import GithubException
 
 # ========== КОНФИГУРАЦИЯ ==========
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
@@ -407,69 +406,69 @@ def admin():
             message = f"🔄 Синхронизация завершена!<br>📁 Основные: {results['main']}, Тестовые: {results['test']}"
             message_type = 'warning'
         
-elif action == 'confirm_order':
-    code = request.form.get('order_code')
-    path = f"{ORDERS_DIR}/{code}.json"
-    content = get_file_content(path)
-    if content:
-        order = json.loads(content)
-        user_email = order.get('user_email')
-        sub_type = order.get('type', 'main')
-        duration = order.get('duration', '1m')
-        is_trial = (duration == '7d')
+        elif action == 'confirm_order':
+            code = request.form.get('order_code')
+            path = f"{ORDERS_DIR}/{code}.json"
+            content = get_file_content(path)
+            if content:
+                order = json.loads(content)
+                user_email = order.get('user_email')
+                sub_type = order.get('type', 'main')
+                duration = order.get('duration', '1m')
+                is_trial = (duration == '7d')
+                
+                # Проверка для пробной подписки
+                if is_trial and user_email:
+                    users_check = get_users()
+                    user_check = users_check.get(user_email)
+                    if user_check:
+                        for sub in user_check.get('subscriptions', []):
+                            if sub.get('duration') == '7d':
+                                message = f"❌ Ошибка: пользователь уже использовал пробную подписку"
+                                message_type = 'error'
+                                # Всё равно удаляем заявку
+                                delete_file(path)
+                                return render_template_string(ADMIN_TEMPLATE, 
+                                              main_subs=main_subs, test_subs=test_subs,
+                                              orders=orders, users=users_list,
+                                              message=message, message_type=message_type)
+                
+                # Создаём подписку
+                url, msg = create_subscription(sub_type, duration, user_email)
+                
+                if url:
+                    # УДАЛЯЕМ ФАЙЛ ЗАЯВКИ (чтобы не обработать повторно)
+                    delete_file(path)
+                    
+                    # Обновляем статус в профиле пользователя
+                    users_local = get_users()
+                    if user_email in users_local:
+                        for o in users_local[user_email].get('orders', []):
+                            if o.get('code') == code:
+                                o['status'] = 'completed'
+                                o['subscription_url'] = url
+                                break
+                        save_users(users_local)
+                    
+                    message = f"✅ Заявка {code} подтверждена! Подписка создана и заявка удалена."
+                    message_type = 'success'
+                else:
+                    message = f"❌ Ошибка создания подписки: {msg}. Заявка удалена."
+                    message_type = 'error'
+                    delete_file(path)  # Всё равно удаляем заявку при ошибке
+            else:
+                message = "❌ Заявка не найдена"
+                message_type = 'error'
         
-        # Проверка для пробной подписки
-        if is_trial and user_email:
-            users_check = get_users()
-            user_check = users_check.get(user_email)
-            if user_check:
-                for sub in user_check.get('subscriptions', []):
-                    if sub.get('duration') == '7d':
-                        message = f"❌ Ошибка: пользователь уже использовал пробную подписку"
-                        message_type = 'error'
-                        # Всё равно удаляем заявку
-                        delete_file(path)
-                        return render_template_string(ADMIN_TEMPLATE, 
-                                      main_subs=main_subs, test_subs=test_subs,
-                                      orders=orders, users=users_list,
-                                      message=message, message_type=message_type)
-        
-        # Создаём подписку
-        url, msg = create_subscription(sub_type, duration, user_email)
-        
-        if url:
-            # УДАЛЯЕМ ФАЙЛ ЗАЯВКИ (чтобы не обработать повторно)
-            delete_file(path)
-            
-            # Обновляем статус в профиле пользователя
-            users_local = get_users()
-            if user_email in users_local:
-                for o in users_local[user_email].get('orders', []):
-                    if o.get('code') == code:
-                        o['status'] = 'completed'
-                        o['subscription_url'] = url
-                        break
-                save_users(users_local)
-            
-            message = f"✅ Заявка {code} подтверждена! Подписка создана и заявка удалена."
-            message_type = 'success'
-        else:
-            message = f"❌ Ошибка создания подписки: {msg}. Заявка удалена."
-            message_type = 'error'
-            delete_file(path)  # Всё равно удаляем заявку при ошибке
-    else:
-        message = "❌ Заявка не найдена"
-        message_type = 'error'
-
-elif action == 'delete_order':
-    code = request.form.get('order_code')
-    path = f"{ORDERS_DIR}/{code}.json"
-    if delete_file(path):
-        message = f"✅ Заявка {code} удалена (отклонена)"
-        message_type = 'success'
-    else:
-        message = "❌ Ошибка удаления"
-        message_type = 'error'
+        elif action == 'delete_order':
+            code = request.form.get('order_code')
+            path = f"{ORDERS_DIR}/{code}.json"
+            if delete_file(path):
+                message = f"✅ Заявка {code} удалена (отклонена)"
+                message_type = 'success'
+            else:
+                message = "❌ Ошибка удаления"
+                message_type = 'error'
     
     return render_template_string(ADMIN_TEMPLATE, 
                                   main_subs=main_subs, 
@@ -539,7 +538,9 @@ ADMIN_TEMPLATE = '''
             <div class="card">
                 <h2>📋 Заявки на оплату</h2>
                 <table>
-                    <thead><tr><th>Код</th><th>Пользователь</th><th>Тариф</th><th>Сумма</th><th>Дата</th><th>Статус</th><th>Действие</th></tr></thead>
+                    <thead>
+                        <tr><th>Код</th><th>Пользователь</th><th>Тариф</th><th>Сумма</th><th>Дата</th><th>Статус</th><th>Действие</th></tr>
+                    </thead>
                     <tbody>
                         {% for order in orders %}
                         <tr>
@@ -565,7 +566,7 @@ ADMIN_TEMPLATE = '''
                             </td>
                         </tr>
                         {% else %}
-                        <tr><td colspan="7">Нет заявок</td></tr>
+                        <tr><td colspan="7">Нет заявок</td></table>
                         {% endfor %}
                     </tbody>
                 </table>
@@ -577,7 +578,9 @@ ADMIN_TEMPLATE = '''
             <div class="card">
                 <h2>📁 Основные подписки (vpn/subs)</h2>
                 <table>
-                    <thead><tr><th>Файл</th><th>Действительна до</th><th>Ссылка</th><th></th></tr></thead>
+                    <thead>
+                        <tr><th>Файл</th><th>Действительна до</th><th>Ссылка</th><th></th></tr>
+                    </thead>
                     <tbody>
                         {% for sub in main_subs %}
                         <tr>
@@ -602,7 +605,9 @@ ADMIN_TEMPLATE = '''
             <div class="card">
                 <h2>🧪 Тестовые подписки (vpn/tests)</h2>
                 <table>
-                    <thead><tr><th>Файл</th><th>Действительна до</th><th>Ссылка</th><th></th></tr></thead>
+                    <thead>
+                        <tr><th>Файл</th><th>Действительна до</th><th>Ссылка</th><th></th></tr>
+                    </thead>
                     <tbody>
                         {% for sub in test_subs %}
                         <tr>
@@ -631,7 +636,9 @@ ADMIN_TEMPLATE = '''
             <div class="card">
                 <h2>👥 Зарегистрированные пользователи</h2>
                 <table>
-                    <thead><tr><th>Email</th><th>Подписок</th><th>Дата регистрации</th></tr></thead>
+                    <thead>
+                        <tr><th>Email</th><th>Подписок</th><th>Дата регистрации</th></tr>
+                    </thead>
                     <tbody>
                         {% for user in users %}
                         <tr>

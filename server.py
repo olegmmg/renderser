@@ -3,6 +3,9 @@
 VPN Subscription Server for Render.com
 - Регистрация и авторизация пользователей
 - Создание подписок и заявок
+- Автопродление при покупке (если такой же тип тарифа)
+- Замена истекших подписок на заглушку
+- Автоудаление через 7 дней после истечения
 - Админ-панель для управления
 """
 
@@ -88,6 +91,12 @@ TEMPLATES = {
 PRICES = {"main": {"7d": 0, "1m": 20, "3m": 50, "12m": 180}, "test": {"7d": 0, "1m": 30, "3m": 75, "12m": 270}}
 DAYS_MAP = {"7d": 7, "1m": 30, "3m": 90, "12m": 365}
 
+# Заглушка для истекших подписок
+EXPIRED_SUB_CONTENT = """#subscription-userinfo: upload=0; download=0; total=0; expire=0
+ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTo2VGhEMUFnd1hjOFN0cHA3aEVvaExh@0.0.0.0:10000#Подписка истекла
+ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTo2VGhEMUFnd1hjOFN0cHA3aEVvaExh@0.0.0.0:10000#Продлите на
+ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTo2VGhEMUFnd1hjOFN0cHA3aEVvaExh@0.0.0.0:10000#olegmmg.github.io/vpn"""
+
 # Файлы для хранения данных
 USERS_FILE = "data/users.json"
 ORDERS_DIR = "data/orders"
@@ -109,8 +118,9 @@ def get_user_by_token(token):
             return email, user
     return None, None
 
-# ========== СОЗДАНИЕ ПОДПИСКИ ==========
+# ========== СОЗДАНИЕ / ПРОДЛЕНИЕ ПОДПИСКИ ==========
 def create_subscription(sub_type, duration, user_email=None):
+    """Создаёт или продлевает подписку. Если у пользователя уже есть подписка того же типа — продлевает её."""
     template_path = TEMPLATES[sub_type]["template_path"]
     output_dir = TEMPLATES[sub_type]["output_dir"]
     days = DAYS_MAP.get(duration, 30)
@@ -119,8 +129,54 @@ def create_subscription(sub_type, duration, user_email=None):
     if not template:
         return None, f"Шаблон {template_path} не найден"
     
-    expire_ts = int((datetime.now() + timedelta(days=days)).timestamp())
-    expire_date = (datetime.now() + timedelta(days=days)).strftime("%d.%m.%Y")
+    now = datetime.now()
+    
+    # Проверяем, есть ли у пользователя активная подписка того же типа
+    existing_sub = None
+    if user_email:
+        users = get_users()
+        user = users.get(user_email, {})
+        for sub in user.get('subscriptions', []):
+            if sub.get('type') == sub_type:
+                expire_ts = sub.get('expire_ts', 0)
+                expire_dt = datetime.fromtimestamp(expire_ts)
+                # Если подписка активна или истекла менее 7 дней назад — продлеваем
+                if expire_dt + timedelta(days=7) > now:
+                    existing_sub = sub
+                    break
+    
+    if existing_sub:
+        # ===== ПРОДЛЕНИЕ СУЩЕСТВУЮЩЕЙ =====
+        current_expire_ts = existing_sub['expire_ts']
+        # Если подписка уже истекла (но меньше 7 дней), стартуем от текущей даты
+        if current_expire_ts < now.timestamp():
+            new_expire_dt = now + timedelta(days=days)
+        else:
+            new_expire_dt = datetime.fromtimestamp(current_expire_ts) + timedelta(days=days)
+        
+        new_expire_ts = int(new_expire_dt.timestamp())
+        new_expire_date = new_expire_dt.strftime("%d.%m.%Y")
+        
+        # Обновляем файл подписки
+        userinfo = f"#subscription-userinfo: upload=0; download=0; total=999999999999999999999999999999999; expire={new_expire_ts}\n"
+        final_config = userinfo + template
+        
+        path = existing_sub['url'].replace("https://olegmmg.github.io/", "")
+        
+        if save_file(path, final_config, f"Продление {sub_type} до {new_expire_date}"):
+            # Обновляем запись в профиле
+            existing_sub['expire_date'] = new_expire_date
+            existing_sub['expire_ts'] = new_expire_ts
+            existing_sub['duration'] = f"продлён до {new_expire_date}"
+            existing_sub['updated_at'] = now.isoformat()
+            save_users(users)
+            
+            url = f"https://olegmmg.github.io/{path}"
+            return url, f"Продлена до {new_expire_date} (добавлено {days} дней)"
+    
+    # ===== НОВАЯ ПОДПИСКА =====
+    expire_ts = int((now + timedelta(days=days)).timestamp())
+    expire_date = (now + timedelta(days=days)).strftime("%d.%m.%Y")
     userinfo = f"#subscription-userinfo: upload=0; download=0; total=999999999999999999999999999999999; expire={expire_ts}\n"
     final_config = userinfo + template
     
@@ -143,12 +199,81 @@ def create_subscription(sub_type, duration, user_email=None):
                     'expire_date': expire_date,
                     'expire_ts': expire_ts,
                     'url': url,
-                    'created_at': datetime.now().isoformat()
+                    'filename': filename,
+                    'created_at': now.isoformat()
                 })
                 save_users(users)
         
         return url, f"Действительна до {expire_date}"
     return None, "Ошибка сохранения"
+
+# ========== ПРОВЕРКА И ЗАМЕНА ИСТЕКШИХ ПОДПИСОК ==========
+def check_expired_subscriptions():
+    """Проверяет все подписки: истекшие заменяет на заглушку, через 7 дней удаляет."""
+    if not repo:
+        return {"error": "GitHub не подключён"}
+    
+    now = int(datetime.now().timestamp())
+    results = {
+        "replaced": [],   # заменены на заглушку
+        "deleted": [],    # удалены полностью
+        "skipped": 0      # пропущены (активные)
+    }
+    
+    for sub_type in ["main", "test"]:
+        output_dir = TEMPLATES[sub_type]["output_dir"]
+        files = list_files_in_dir(output_dir)
+        
+        for filename in files:
+            path = f"{output_dir}/{filename}"
+            content = get_file_content(path)
+            if not content:
+                continue
+            
+            # Извлекаем expire из userinfo
+            expire_ts = 0
+            for line in content.split('\n'):
+                if line.startswith('#subscription-userinfo:') and 'expire=' in line:
+                    try:
+                        expire_ts = int(line.split('expire=')[1].split(';')[0].split('\n')[0])
+                    except:
+                        pass
+                    break
+            
+            if expire_ts == 0:
+                # Нет даты истечения — пропускаем
+                results["skipped"] += 1
+                continue
+            
+            # Проверяем: истекла ли подписка
+            if expire_ts > now:
+                # Ещё активна
+                results["skipped"] += 1
+                continue
+            
+            # Подписка истекла. Проверяем, прошло ли 7 дней
+            delete_deadline = expire_ts + (7 * 24 * 60 * 60)  # +7 дней
+            
+            if now >= delete_deadline:
+                # Удаляем полностью
+                if delete_file(path):
+                    results["deleted"].append(f"{sub_type}/{filename}")
+            else:
+                # Заменяем на заглушку (если ещё не заменена)
+                if "Подписка истекла" not in content:
+                    # Сохраняем оригинальный expire_ts в заглушке, 
+                    # чтобы при следующей проверке знать когда удалять
+                    stub = EXPIRED_SUB_CONTENT.replace("expire=0", f"expire={expire_ts}")
+                    if save_file(path, stub, f"Подписка {filename} истекла"):
+                        results["replaced"].append(f"{sub_type}/{filename}")
+                else:
+                    # Уже заглушка — обновляем expire если надо
+                    if f"expire={expire_ts}" not in content:
+                        stub = EXPIRED_SUB_CONTENT.replace("expire=0", f"expire={expire_ts}")
+                        save_file(path, stub, f"Обновление заглушки {filename}")
+                    results["skipped"] += 1
+    
+    return results
 
 # ========== СИНХРОНИЗАЦИЯ ==========
 def sync_all_subscriptions():
@@ -163,6 +288,10 @@ def sync_all_subscriptions():
             try:
                 existing_file = repo.get_contents(path, ref=BRANCH)
                 old_content = base64.b64decode(existing_file.content).decode('utf-8')
+                
+                # Пропускаем истекшие (с заглушкой)
+                if "Подписка истекла" in old_content:
+                    continue
                 
                 old_userinfo = ""
                 for line in old_content.split('\n'):
@@ -186,21 +315,33 @@ def get_all_subscriptions():
             path = f"{output_dir}/{filename}"
             content = get_file_content(path)
             expire_date = "не указана"
+            is_expired = False
+            is_stub = False
+            
             if content:
+                # Проверяем, заглушка ли это
+                if "Подписка истекла" in content:
+                    is_stub = True
+                
                 for line in content.split('\n'):
                     if 'expire=' in line:
                         try:
                             ts = int(line.split('expire=')[1].split(';')[0])
-                            expire_date = datetime.fromtimestamp(ts).strftime("%d.%m.%Y")
+                            expire_date = datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
+                            if ts < int(datetime.now().timestamp()):
+                                is_expired = True
                         except: pass
                         break
+            
             subs.append({
                 "type": sub_type,
                 "type_name": TEMPLATES[sub_type]["name"],
                 "filename": filename,
                 "path": path,
                 "url": f"https://olegmmg.github.io/{path}",
-                "expire_date": expire_date
+                "expire_date": expire_date,
+                "expired": is_expired,
+                "is_stub": is_stub
             })
     return subs
 
@@ -250,7 +391,6 @@ def login():
     if not user or user.get('password') != hash_password(password):
         return jsonify({'success': False, 'error': 'Неверный email или пароль'})
     
-    # Обновляем токен
     new_token = str(uuid.uuid4())
     user['token'] = new_token
     save_users(users)
@@ -280,9 +420,18 @@ def my_subscriptions():
         return jsonify({'subscriptions': []})
     
     subs = user.get('subscriptions', [])
-    # Сортируем по убыванию даты
-    subs.sort(key=lambda x: x.get('expire_ts', 0), reverse=True)
+    # Обновляем статусы на основе реальных файлов
+    now_ts = int(datetime.now().timestamp())
+    for sub in subs:
+        if sub.get('expire_ts', 0) < now_ts:
+            sub['status'] = 'expired'
+            # Проверяем, прошло ли 7 дней
+            if sub.get('expire_ts', 0) + (7 * 24 * 60 * 60) < now_ts:
+                sub['status'] = 'deleted'
+        else:
+            sub['status'] = 'active'
     
+    subs.sort(key=lambda x: x.get('expire_ts', 0), reverse=True)
     return jsonify({'subscriptions': subs})
 
 # Создание заявки на оплату
@@ -300,7 +449,6 @@ def create_order():
     if not code:
         return jsonify({'success': False, 'error': 'Нет кода'})
     
-    # Создаём заявку
     order = {
         'code': code,
         'user_email': email,
@@ -313,9 +461,7 @@ def create_order():
         'status': 'pending'
     }
     
-    # Сохраняем заявку
     if save_file(f"{ORDERS_DIR}/{code}.json", json.dumps(order, ensure_ascii=False, indent=2), f"Заявка #{code}"):
-        # Добавляем заявку в профиль пользователя
         if 'orders' not in user:
             user['orders'] = []
         user['orders'].append({'code': code, 'status': 'pending', 'created_at': order['timestamp']})
@@ -337,6 +483,12 @@ def api_create():
         return jsonify({'success': True, 'url': url, 'message': msg})
     return jsonify({'success': False, 'error': msg})
 
+# Проверка истекших подписок (API для внешнего cron)
+@app.route('/api/check-expired', methods=['GET', 'POST'])
+def api_check_expired():
+    results = check_expired_subscriptions()
+    return jsonify({'success': True, **results})
+
 # ========== АДМИН-ПАНЕЛЬ ==========
 
 @app.route('/admin', methods=['GET', 'POST'])
@@ -344,13 +496,9 @@ def admin():
     if not repo:
         return "<h1>❌ GitHub не настроен</h1><p>Укажите GITHUB_TOKEN</p>"
     
-    main_subs = []
-    test_subs = []
-    for sub in get_all_subscriptions():
-        if sub['type'] == 'main':
-            main_subs.append(sub)
-        else:
-            test_subs.append(sub)
+    all_subs = get_all_subscriptions()
+    main_subs = [s for s in all_subs if s['type'] == 'main']
+    test_subs = [s for s in all_subs if s['type'] == 'test']
     
     # Получаем заявки
     orders = []
@@ -406,7 +554,19 @@ def admin():
             message = f"🔄 Синхронизация завершена!<br>📁 Основные: {results['main']}, Тестовые: {results['test']}"
             message_type = 'warning'
         
-        if action == 'confirm_order':
+        elif action == 'check_expired':
+            results = check_expired_subscriptions()
+            msg_parts = []
+            if results.get('replaced'):
+                msg_parts.append(f"🔄 Заменены на заглушку ({len(results['replaced'])}):<br>" + "<br>".join(results['replaced']))
+            if results.get('deleted'):
+                msg_parts.append(f"🗑️ Удалены ({len(results['deleted'])}):<br>" + "<br>".join(results['deleted']))
+            if not msg_parts:
+                msg_parts.append(f"✅ Всё актуально (проверено {results.get('skipped', 0)} подписок)")
+            message = "<br><br>".join(msg_parts)
+            message_type = 'success' if not results.get('error') else 'error'
+        
+        elif action == 'confirm_order':
             code = request.form.get('order_code')
             path = f"{ORDERS_DIR}/{code}.json"
             content = get_file_content(path)
@@ -423,24 +583,18 @@ def admin():
                     user_check = users_check.get(user_email)
                     if user_check:
                         for sub in user_check.get('subscriptions', []):
-                            if sub.get('duration') == '7d':
+                            if sub.get('duration') == '7d' and sub.get('expire_ts', 0) > int(datetime.now().timestamp()):
                                 message = f"❌ Ошибка: пользователь уже использовал пробную подписку"
                                 message_type = 'error'
-                                # Всё равно удаляем заявку
                                 delete_file(path)
-                                return render_template_string(ADMIN_TEMPLATE, 
-                                              main_subs=main_subs, test_subs=test_subs,
-                                              orders=orders, users=users_list,
-                                              message=message, message_type=message_type)
+                                # Редирект чтобы обновить список
+                                return redirect('/admin')
                 
-                # Создаём подписку
                 url, msg = create_subscription(sub_type, duration, user_email)
                 
                 if url:
-                    # УДАЛЯЕМ ФАЙЛ ЗАЯВКИ (чтобы не обработать повторно)
                     delete_file(path)
                     
-                    # Обновляем статус в профиле пользователя
                     users_local = get_users()
                     if user_email in users_local:
                         for o in users_local[user_email].get('orders', []):
@@ -450,12 +604,12 @@ def admin():
                                 break
                         save_users(users_local)
                     
-                    message = f"✅ Заявка {code} подтверждена! Подписка создана и заявка удалена."
+                    message = f"✅ Заявка {code} подтверждена!<br>📅 {msg}"
                     message_type = 'success'
                 else:
-                    message = f"❌ Ошибка создания подписки: {msg}. Заявка удалена."
+                    message = f"❌ Ошибка: {msg}"
                     message_type = 'error'
-                    delete_file(path)  # Всё равно удаляем заявку при ошибке
+                    delete_file(path)
             else:
                 message = "❌ Заявка не найдена"
                 message_type = 'error'
@@ -469,6 +623,9 @@ def admin():
             else:
                 message = "❌ Ошибка удаления"
                 message_type = 'error'
+        
+        # Перенаправляем чтобы обновить данные
+        return redirect('/admin')
     
     return render_template_string(ADMIN_TEMPLATE, 
                                   main_subs=main_subs, 
@@ -485,6 +642,7 @@ ADMIN_TEMPLATE = '''
 <head>
     <title>VPN Admin Panel</title>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0e1a; padding: 20px; color: #e2e8f0; }
@@ -502,19 +660,24 @@ ADMIN_TEMPLATE = '''
         .btn-success { background: #22c55e; color: white; }
         .btn-danger { background: #ef4444; color: white; }
         .btn-warning { background: #f59e0b; color: #1a1a2e; }
+        .btn-purple { background: #8b5cf6; color: white; }
         table { width: 100%; border-collapse: collapse; margin-top: 15px; }
         th, td { padding: 10px; text-align: left; border-bottom: 1px solid #1f2937; }
         th { background: #0f1622; color: #60a5fa; }
         tr:hover { background: #1a2332; }
         select, input { background: #1f2937; color: #e2e8f0; border: 1px solid #374151; padding: 8px; border-radius: 6px; }
-        .status-pending { background: #f59e0b; padding: 2px 8px; border-radius: 20px; font-size: 11px; }
-        .status-completed { background: #22c55e; padding: 2px 8px; border-radius: 20px; font-size: 11px; }
+        .status-pending { background: #f59e0b; color: #000; padding: 2px 8px; border-radius: 20px; font-size: 11px; }
+        .status-completed { background: #22c55e; color: #000; padding: 2px 8px; border-radius: 20px; font-size: 11px; }
+        .expired { background: #ef4444; color: white; padding: 2px 8px; border-radius: 20px; font-size: 11px; }
+        .stub { background: #8b5cf6; color: white; padding: 2px 8px; border-radius: 20px; font-size: 11px; }
+        .active-sub { background: #22c55e; color: #000; padding: 2px 8px; border-radius: 20px; font-size: 11px; }
         .success { background: #065f46; color: #d1fae5; padding: 12px; border-radius: 12px; margin-bottom: 15px; }
         .error { background: #991b1b; color: #fecaca; padding: 12px; border-radius: 12px; margin-bottom: 15px; }
         .warning { background: #92400e; color: #fef3c7; padding: 12px; border-radius: 12px; margin-bottom: 15px; }
         .row { display: flex; gap: 20px; flex-wrap: wrap; }
         .col { flex: 1; min-width: 300px; }
-        code { background: #1f2937; padding: 2px 6px; border-radius: 4px; font-size: 11px; }
+        code { background: #1f2937; padding: 2px 6px; border-radius: 4px; font-size: 11px; word-break: break-all; }
+        a { color: #60a5fa; }
     </style>
 </head>
 <body>
@@ -530,7 +693,7 @@ ADMIN_TEMPLATE = '''
             <button class="tab-btn" onclick="showTab('subscriptions')">🔑 Подписки</button>
             <button class="tab-btn" onclick="showTab('users')">👥 Пользователи</button>
             <button class="tab-btn" onclick="showTab('create')">➕ Создать</button>
-            <button class="tab-btn" onclick="showTab('sync')">🔄 Синхронизация</button>
+            <button class="tab-btn" onclick="showTab('tools')">🛠️ Инструменты</button>
         </div>
         
         <!-- Заявки -->
@@ -555,7 +718,7 @@ ADMIN_TEMPLATE = '''
                                 <form method="POST" style="display:inline;">
                                     <input type="hidden" name="action" value="confirm_order">
                                     <input type="hidden" name="order_code" value="{{ order.code }}">
-                                    <button type="submit" class="btn-success" style="padding:4px 12px;">✅ Подтвердить</button>
+                                    <button type="submit" class="btn-success" style="padding:4px 12px;">✅</button>
                                 </form>
                                 <form method="POST" style="display:inline;">
                                     <input type="hidden" name="action" value="delete_order">
@@ -579,14 +742,20 @@ ADMIN_TEMPLATE = '''
                 <h2>📁 Основные подписки (vpn/subs)</h2>
                 <table>
                     <thead>
-                        <tr><th>Файл</th><th>Действительна до</th><th>Ссылка</th><th></th></tr>
+                        <tr><th>Файл</th><th>Действительна до</th><th>Статус</th><th>Ссылка</th><th></th></tr>
                     </thead>
                     <tbody>
                         {% for sub in main_subs %}
                         <tr>
                             <td><code>{{ sub.filename }}</code></td>
                             <td>{{ sub.expire_date }}</td>
-                            <td><code style="font-size:9px;">{{ sub.url }}</code></td>
+                            <td>
+                                {% if sub.is_stub %}<span class="stub">🔒 Заглушка</span>
+                                {% elif sub.expired %}<span class="expired">❌ Истекла</span>
+                                {% else %}<span class="active-sub">✅ Активна</span>
+                                {% endif %}
+                            </td>
+                            <td><a href="{{ sub.url }}" target="_blank"><code style="font-size:9px;">{{ sub.filename }}</code></a></td>
                             <td>
                                 <form method="POST">
                                     <input type="hidden" name="action" value="delete">
@@ -597,7 +766,7 @@ ADMIN_TEMPLATE = '''
                             </td>
                         </tr>
                         {% else %}
-                        <tr><td colspan="4">Нет подписок</td></tr>
+                        <tr><td colspan="5">Нет подписок</td></tr>
                         {% endfor %}
                     </tbody>
                 </table>
@@ -606,14 +775,20 @@ ADMIN_TEMPLATE = '''
                 <h2>🧪 Тестовые подписки (vpn/tests)</h2>
                 <table>
                     <thead>
-                        <tr><th>Файл</th><th>Действительна до</th><th>Ссылка</th><th></th></tr>
+                        <tr><th>Файл</th><th>Действительна до</th><th>Статус</th><th>Ссылка</th><th></th></tr>
                     </thead>
                     <tbody>
                         {% for sub in test_subs %}
                         <tr>
                             <td><code>{{ sub.filename }}</code></td>
                             <td>{{ sub.expire_date }}</td>
-                            <td><code style="font-size:9px;">{{ sub.url }}</code></td>
+                            <td>
+                                {% if sub.is_stub %}<span class="stub">🔒 Заглушка</span>
+                                {% elif sub.expired %}<span class="expired">❌ Истекла</span>
+                                {% else %}<span class="active-sub">✅ Активна</span>
+                                {% endif %}
+                            </td>
+                            <td><a href="{{ sub.url }}" target="_blank"><code style="font-size:9px;">{{ sub.filename }}</code></a></td>
                             <td>
                                 <form method="POST">
                                     <input type="hidden" name="action" value="delete">
@@ -624,7 +799,7 @@ ADMIN_TEMPLATE = '''
                             </td>
                         </tr>
                         {% else %}
-                        <tr><td colspan="4">Нет подписок</td></tr>
+                        <tr><td colspan="5">Нет подписок</td></tr>
                         {% endfor %}
                     </tbody>
                 </table>
@@ -682,18 +857,25 @@ ADMIN_TEMPLATE = '''
                     <div style="margin-bottom:10px;">
                         <input type="text" name="user_email" placeholder="Email пользователя (опционально)">
                     </div>
-                    <button type="submit" name="action" value="create" class="btn btn-primary">Создать подписку</button>
+                    <button type="submit" name="action" value="create" class="btn btn-primary">Создать / Продлить подписку</button>
                 </form>
             </div>
         </div>
         
-        <!-- Синхронизация -->
-        <div id="tab-sync" class="tab-content">
+        <!-- Инструменты -->
+        <div id="tab-tools" class="tab-content">
             <div class="card">
                 <h2>🔄 Синхронизация подписок с шаблонами</h2>
-                <p>Обновляет все подписки по текущим шаблонам (даты окончания сохраняются).</p>
+                <p>Обновляет все АКТИВНЫЕ подписки по текущим шаблонам (даты окончания сохраняются). Истекшие (заглушки) пропускаются.</p>
                 <form method="POST">
                     <button type="submit" name="action" value="sync" class="btn btn-warning">🔄 Синхронизировать все подписки</button>
+                </form>
+            </div>
+            <div class="card">
+                <h2>🔍 Проверка истекших подписок</h2>
+                <p>Истекшие заменяются на заглушку. Через 7 дней после истечения — удаляются полностью.</p>
+                <form method="POST">
+                    <button type="submit" name="action" value="check_expired" class="btn btn-purple">🔍 Проверить истекшие</button>
                 </form>
             </div>
         </div>

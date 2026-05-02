@@ -7,7 +7,7 @@ VPN Subscription Server for Render.com
 - Мгновенная активация пробной подписки (без заявки)
 - Замена истекших подписок на заглушку
 - Автоудаление через 7 дней после истечения
-- Админ-панель с отображением статуса пробной подписки
+- Админ-панель с отображением владельцев подписок и статусом пробных
 """
 
 import os, json, base64, random, string, hashlib, uuid
@@ -124,7 +124,6 @@ def user_can_take_trial(email):
     user = users.get(email)
     if not user:
         return True
-    # Проверяем все подписки пользователя: любая с duration='7d' считается пробной
     for sub in user.get('subscriptions', []):
         if sub.get('duration') == '7d':
             return False
@@ -145,25 +144,24 @@ def create_subscription(sub_type, duration, user_email=None):
     users = get_users() if user_email else {}
     user = users.get(user_email, {}) if user_email else {}
 
-    # Проверяем, есть ли у пользователя активная подписка того же типа (для продления)
+    # Проверяем, есть ли активная подписка такого же типа для продления
     existing_sub = None
     if user_email:
         for sub in user.get('subscriptions', []):
             if sub.get('type') == sub_type:
                 expire_ts = sub.get('expire_ts', 0)
                 expire_dt = datetime.fromtimestamp(expire_ts)
-                # Если подписка активна или истекла менее 7 дней назад — продлеваем
                 if expire_dt + timedelta(days=7) > now:
                     existing_sub = sub
                     break
 
-    # Если это пробная подписка (duration='7d'), проверяем, не использована ли она
+    # Проверка пробной подписки
     if duration == '7d' and user_email:
         if not user_can_take_trial(user_email):
             return None, "Пробная подписка уже была использована"
 
     if existing_sub:
-        # ===== ПРОДЛЕНИЕ СУЩЕСТВУЮЩЕЙ =====
+        # Продление существующей
         current_expire_ts = existing_sub['expire_ts']
         if current_expire_ts < now.timestamp():
             new_expire_dt = now + timedelta(days=days)
@@ -181,13 +179,12 @@ def create_subscription(sub_type, duration, user_email=None):
         if save_file(path, final_config, f"Продление {sub_type} до {new_expire_date}"):
             existing_sub['expire_date'] = new_expire_date
             existing_sub['expire_ts'] = new_expire_ts
-            existing_sub['duration'] = f"продлён до {new_expire_date}"
             existing_sub['updated_at'] = now.isoformat()
             save_users(users)
             url = f"https://olegmmg.github.io/{path}"
-            return url, f"Продлена до {new_expire_date} (добавлено {days} дней)"
+            return url, f"Продлена до {new_expire_date} (добавлено {days} дн.)"
 
-    # ===== НОВАЯ ПОДПИСКА =====
+    # Новая подписка
     expire_ts = int((now + timedelta(days=days)).timestamp())
     expire_date = (now + timedelta(days=days)).strftime("%d.%m.%Y")
     userinfo = f"#subscription-userinfo: upload=0; download=0; total=999999999999999999999999999999999; expire={expire_ts}\n"
@@ -212,7 +209,6 @@ def create_subscription(sub_type, duration, user_email=None):
                 'filename': filename,
                 'created_at': now.isoformat()
             })
-            # Если это пробная, помечаем использованной
             if duration == '7d':
                 user['trial_used'] = True
             save_users(users)
@@ -222,7 +218,6 @@ def create_subscription(sub_type, duration, user_email=None):
 
 # ========== ПРОВЕРКА И ЗАМЕНА ИСТЕКШИХ ПОДПИСОК ==========
 def check_expired_subscriptions():
-    """Проверяет все подписки: истекшие заменяет на заглушку, через 7 дней удаляет."""
     if not repo:
         return {"error": "GitHub не подключён"}
 
@@ -450,7 +445,6 @@ def activate_trial():
 
     url, msg = create_subscription(sub_type, '7d', email)
     if url:
-        # Обновляем trial_used явно (на случай если create_subscription не сохранил)
         users = get_users()
         if email in users:
             users[email]['trial_used'] = True
@@ -519,6 +513,18 @@ def admin():
     main_subs = [s for s in all_subs if s['type'] == 'main']
     test_subs = [s for s in all_subs if s['type'] == 'test']
 
+    # Привязка подписок к пользователям
+    users = get_users()
+    url_to_user = {}
+    for email, user in users.items():
+        for sub in user.get('subscriptions', []):
+            url = sub.get('url')
+            if url:
+                url_to_user[url] = email
+    for sub in main_subs + test_subs:
+        sub['user_email'] = url_to_user.get(sub['url'], '—')
+
+    # Заявки
     orders = []
     try:
         contents = repo.get_contents(ORDERS_DIR, ref=BRANCH)
@@ -530,7 +536,7 @@ def admin():
     except:
         pass
 
-    users = get_users()
+    # Список пользователей для таблицы
     users_list = []
     for e, u in users.items():
         users_list.append({
@@ -599,7 +605,6 @@ def admin():
                 sub_type = order.get('type', 'main')
                 duration = order.get('duration', '1m')
 
-                # Пробная подписка уже обрабатывается на фронте отдельно, но оставим проверку
                 url, msg = create_subscription(sub_type, duration, user_email)
                 if url:
                     delete_file(path)
@@ -689,11 +694,11 @@ ADMIN_TEMPLATE = '''
 <body>
     <div class="container">
         <h1>🔐 VPN Admin Panel</h1>
-        
+
         {% if message %}
         <div class="{{ message_type }}">{{ message | safe }}</div>
         {% endif %}
-        
+
         <div class="tabs">
             <button class="tab-btn active" onclick="showTab('orders')">📋 Заявки</button>
             <button class="tab-btn" onclick="showTab('subscriptions')">🔑 Подписки</button>
@@ -701,7 +706,7 @@ ADMIN_TEMPLATE = '''
             <button class="tab-btn" onclick="showTab('create')">➕ Создать</button>
             <button class="tab-btn" onclick="showTab('tools')">🛠️ Инструменты</button>
         </div>
-        
+
         <!-- Заявки -->
         <div id="tab-orders" class="tab-content active">
             <div class="card">
@@ -741,18 +746,19 @@ ADMIN_TEMPLATE = '''
                 </table>
             </div>
         </div>
-        
+
         <!-- Подписки -->
         <div id="tab-subscriptions" class="tab-content">
             <div class="card">
                 <h2>📁 Основные подписки (vpn/subs)</h2>
                 <table>
                     <thead>
-                        <tr><th>Файл</th><th>Действительна до</th><th>Статус</th><th>Ссылка</th><th></th></tr>
+                        <tr><th>👤 Пользователь</th><th>Файл</th><th>Действительна до</th><th>Статус</th><th>Ссылка</th><th></th></tr>
                     </thead>
                     <tbody>
                         {% for sub in main_subs %}
                         <tr>
+                            <td>{{ sub.user_email }}</td>
                             <td><code>{{ sub.filename }}</code></td>
                             <td>{{ sub.expire_date }}</td>
                             <td>
@@ -772,7 +778,7 @@ ADMIN_TEMPLATE = '''
                             </td>
                         </tr>
                         {% else %}
-                        <tr><td colspan="5">Нет подписок</td></tr>
+                        <tr><td colspan="6">Нет подписок</td></tr>
                         {% endfor %}
                     </tbody>
                 </table>
@@ -781,11 +787,12 @@ ADMIN_TEMPLATE = '''
                 <h2>🧪 Тестовые подписки (vpn/tests)</h2>
                 <table>
                     <thead>
-                        <tr><th>Файл</th><th>Действительна до</th><th>Статус</th><th>Ссылка</th><th></th></tr>
+                        <tr><th>👤 Пользователь</th><th>Файл</th><th>Действительна до</th><th>Статус</th><th>Ссылка</th><th></th></tr>
                     </thead>
                     <tbody>
                         {% for sub in test_subs %}
                         <tr>
+                            <td>{{ sub.user_email }}</td>
                             <td><code>{{ sub.filename }}</code></td>
                             <td>{{ sub.expire_date }}</td>
                             <td>
@@ -805,30 +812,31 @@ ADMIN_TEMPLATE = '''
                             </td>
                         </tr>
                         {% else %}
-                        <tr><td colspan="5">Нет подписок</td></tr>
+                        <tr><td colspan="6">Нет подписок</td></tr>
                         {% endfor %}
                     </tbody>
                 </table>
             </div>
         </div>
-        
+
         <!-- Пользователи -->
         <div id="tab-users" class="tab-content">
             <div class="card">
                 <h2>👥 Зарегистрированные пользователи</h2>
                 <table>
                     <thead>
-                        <tr><th>Email</th><th>Подписок</th><th>Дата регистрации</th></tr>
+                        <tr><th>Email</th><th>Подписок</th><th>Пробная</th><th>Дата регистрации</th></tr>
                     </thead>
                     <tbody>
                         {% for user in users %}
                         <tr>
                             <td>{{ user.email }}</td>
                             <td>{{ user.subscriptions_count }}</td>
+                            <td>{% if user.trial_used %}❌ Использована{% else %}✅ Доступна{% endif %}</td>
                             <td>{{ user.created_at[:16] }}</td>
                         </tr>
                         {% else %}
-                        <tr><td colspan="3">Нет пользователей</td></tr>
+                        <tr><td colspan="4">Нет пользователей</td></tr>
                         {% endfor %}
                     </tbody>
                 </table>
@@ -840,7 +848,7 @@ ADMIN_TEMPLATE = '''
                 <p>📝 Комментарий: <strong>код из заявки (6 цифр)</strong></p>
             </div>
         </div>
-        
+
         <!-- Создание подписки -->
         <div id="tab-create" class="tab-content">
             <div class="card">
@@ -867,7 +875,7 @@ ADMIN_TEMPLATE = '''
                 </form>
             </div>
         </div>
-        
+
         <!-- Инструменты -->
         <div id="tab-tools" class="tab-content">
             <div class="card">
@@ -886,7 +894,7 @@ ADMIN_TEMPLATE = '''
             </div>
         </div>
     </div>
-    
+
     <script>
         function showTab(tab) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));

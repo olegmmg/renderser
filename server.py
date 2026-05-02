@@ -4,9 +4,10 @@ VPN Subscription Server for Render.com
 - Регистрация и авторизация пользователей
 - Создание подписок и заявок
 - Автопродление при покупке (если такой же тип тарифа)
+- Мгновенная активация пробной подписки (без заявки)
 - Замена истекших подписок на заглушку
 - Автоудаление через 7 дней после истечения
-- Админ-панель для управления
+- Админ-панель с отображением статуса пробной подписки
 """
 
 import os, json, base64, random, string, hashlib, uuid
@@ -97,7 +98,6 @@ ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTo2VGhEMUFnd1hjOFN0cHA3aEVvaExh@0.0.0.0:10000#
 ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTo2VGhEMUFnd1hjOFN0cHA3aEVvaExh@0.0.0.0:10000#Продлите на
 ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTo2VGhEMUFnd1hjOFN0cHA3aEVvaExh@0.0.0.0:10000#olegmmg.github.io/vpn"""
 
-# Файлы для хранения данных
 USERS_FILE = "data/users.json"
 ORDERS_DIR = "data/orders"
 
@@ -118,24 +118,36 @@ def get_user_by_token(token):
             return email, user
     return None, None
 
+def user_can_take_trial(email):
+    """Проверяет, не использовал ли пользователь пробную подписку (любой тип)"""
+    users = get_users()
+    user = users.get(email)
+    if not user:
+        return True
+    # Проверяем все подписки пользователя: любая с duration='7d' считается пробной
+    for sub in user.get('subscriptions', []):
+        if sub.get('duration') == '7d':
+            return False
+    return True
+
 # ========== СОЗДАНИЕ / ПРОДЛЕНИЕ ПОДПИСКИ ==========
 def create_subscription(sub_type, duration, user_email=None):
     """Создаёт или продлевает подписку. Если у пользователя уже есть подписка того же типа — продлевает её."""
     template_path = TEMPLATES[sub_type]["template_path"]
     output_dir = TEMPLATES[sub_type]["output_dir"]
     days = DAYS_MAP.get(duration, 30)
-    
+
     template = get_file_content(template_path)
     if not template:
         return None, f"Шаблон {template_path} не найден"
-    
+
     now = datetime.now()
-    
-    # Проверяем, есть ли у пользователя активная подписка того же типа
+    users = get_users() if user_email else {}
+    user = users.get(user_email, {}) if user_email else {}
+
+    # Проверяем, есть ли у пользователя активная подписка того же типа (для продления)
     existing_sub = None
     if user_email:
-        users = get_users()
-        user = users.get(user_email, {})
         for sub in user.get('subscriptions', []):
             if sub.get('type') == sub_type:
                 expire_ts = sub.get('expire_ts', 0)
@@ -144,66 +156,67 @@ def create_subscription(sub_type, duration, user_email=None):
                 if expire_dt + timedelta(days=7) > now:
                     existing_sub = sub
                     break
-    
+
+    # Если это пробная подписка (duration='7d'), проверяем, не использована ли она
+    if duration == '7d' and user_email:
+        if not user_can_take_trial(user_email):
+            return None, "Пробная подписка уже была использована"
+
     if existing_sub:
         # ===== ПРОДЛЕНИЕ СУЩЕСТВУЮЩЕЙ =====
         current_expire_ts = existing_sub['expire_ts']
-        # Если подписка уже истекла (но меньше 7 дней), стартуем от текущей даты
         if current_expire_ts < now.timestamp():
             new_expire_dt = now + timedelta(days=days)
         else:
             new_expire_dt = datetime.fromtimestamp(current_expire_ts) + timedelta(days=days)
-        
+
         new_expire_ts = int(new_expire_dt.timestamp())
         new_expire_date = new_expire_dt.strftime("%d.%m.%Y")
-        
-        # Обновляем файл подписки
+
         userinfo = f"#subscription-userinfo: upload=0; download=0; total=999999999999999999999999999999999; expire={new_expire_ts}\n"
         final_config = userinfo + template
-        
+
         path = existing_sub['url'].replace("https://olegmmg.github.io/", "")
-        
+
         if save_file(path, final_config, f"Продление {sub_type} до {new_expire_date}"):
-            # Обновляем запись в профиле
             existing_sub['expire_date'] = new_expire_date
             existing_sub['expire_ts'] = new_expire_ts
             existing_sub['duration'] = f"продлён до {new_expire_date}"
             existing_sub['updated_at'] = now.isoformat()
             save_users(users)
-            
             url = f"https://olegmmg.github.io/{path}"
             return url, f"Продлена до {new_expire_date} (добавлено {days} дней)"
-    
+
     # ===== НОВАЯ ПОДПИСКА =====
     expire_ts = int((now + timedelta(days=days)).timestamp())
     expire_date = (now + timedelta(days=days)).strftime("%d.%m.%Y")
     userinfo = f"#subscription-userinfo: upload=0; download=0; total=999999999999999999999999999999999; expire={expire_ts}\n"
     final_config = userinfo + template
-    
+
     filename = generate_subscription_name()
     path = f"{output_dir}/{filename}"
-    
+
     if save_file(path, final_config, f"Подписка {sub_type} до {expire_date}"):
         url = f"https://olegmmg.github.io/{path}"
-        
-        # Привязываем подписку к пользователю
+
         if user_email:
-            users = get_users()
-            if user_email in users:
-                if 'subscriptions' not in users[user_email]:
-                    users[user_email]['subscriptions'] = []
-                users[user_email]['subscriptions'].append({
-                    'type': sub_type,
-                    'duration': duration,
-                    'plan_name': f"{TEMPLATES[sub_type]['name']} на {days} дней",
-                    'expire_date': expire_date,
-                    'expire_ts': expire_ts,
-                    'url': url,
-                    'filename': filename,
-                    'created_at': now.isoformat()
-                })
-                save_users(users)
-        
+            if 'subscriptions' not in user:
+                user['subscriptions'] = []
+            user['subscriptions'].append({
+                'type': sub_type,
+                'duration': duration,
+                'plan_name': f"{TEMPLATES[sub_type]['name']} на {days} дней",
+                'expire_date': expire_date,
+                'expire_ts': expire_ts,
+                'url': url,
+                'filename': filename,
+                'created_at': now.isoformat()
+            })
+            # Если это пробная, помечаем использованной
+            if duration == '7d':
+                user['trial_used'] = True
+            save_users(users)
+
         return url, f"Действительна до {expire_date}"
     return None, "Ошибка сохранения"
 
@@ -212,25 +225,20 @@ def check_expired_subscriptions():
     """Проверяет все подписки: истекшие заменяет на заглушку, через 7 дней удаляет."""
     if not repo:
         return {"error": "GitHub не подключён"}
-    
+
     now = int(datetime.now().timestamp())
-    results = {
-        "replaced": [],   # заменены на заглушку
-        "deleted": [],    # удалены полностью
-        "skipped": 0      # пропущены (активные)
-    }
-    
+    results = {"replaced": [], "deleted": [], "skipped": 0}
+
     for sub_type in ["main", "test"]:
         output_dir = TEMPLATES[sub_type]["output_dir"]
         files = list_files_in_dir(output_dir)
-        
+
         for filename in files:
             path = f"{output_dir}/{filename}"
             content = get_file_content(path)
             if not content:
                 continue
-            
-            # Извлекаем expire из userinfo
+
             expire_ts = 0
             for line in content.split('\n'):
                 if line.startswith('#subscription-userinfo:') and 'expire=' in line:
@@ -239,40 +247,32 @@ def check_expired_subscriptions():
                     except:
                         pass
                     break
-            
+
             if expire_ts == 0:
-                # Нет даты истечения — пропускаем
                 results["skipped"] += 1
                 continue
-            
-            # Проверяем: истекла ли подписка
+
             if expire_ts > now:
-                # Ещё активна
                 results["skipped"] += 1
                 continue
-            
-            # Подписка истекла. Проверяем, прошло ли 7 дней
-            delete_deadline = expire_ts + (7 * 24 * 60 * 60)  # +7 дней
-            
+
+            # Истекла
+            delete_deadline = expire_ts + (7 * 24 * 60 * 60)
+
             if now >= delete_deadline:
-                # Удаляем полностью
                 if delete_file(path):
                     results["deleted"].append(f"{sub_type}/{filename}")
             else:
-                # Заменяем на заглушку (если ещё не заменена)
                 if "Подписка истекла" not in content:
-                    # Сохраняем оригинальный expire_ts в заглушке, 
-                    # чтобы при следующей проверке знать когда удалять
                     stub = EXPIRED_SUB_CONTENT.replace("expire=0", f"expire={expire_ts}")
                     if save_file(path, stub, f"Подписка {filename} истекла"):
                         results["replaced"].append(f"{sub_type}/{filename}")
                 else:
-                    # Уже заглушка — обновляем expire если надо
                     if f"expire={expire_ts}" not in content:
                         stub = EXPIRED_SUB_CONTENT.replace("expire=0", f"expire={expire_ts}")
                         save_file(path, stub, f"Обновление заглушки {filename}")
                     results["skipped"] += 1
-    
+
     return results
 
 # ========== СИНХРОНИЗАЦИЯ ==========
@@ -281,24 +281,23 @@ def sync_all_subscriptions():
     for sub_type in ["main", "test"]:
         template = get_file_content(TEMPLATES[sub_type]["template_path"])
         if not template: continue
-        
+
         files = list_files_in_dir(TEMPLATES[sub_type]["output_dir"])
         for filename in files:
             path = f"{TEMPLATES[sub_type]['output_dir']}/{filename}"
             try:
                 existing_file = repo.get_contents(path, ref=BRANCH)
                 old_content = base64.b64decode(existing_file.content).decode('utf-8')
-                
-                # Пропускаем истекшие (с заглушкой)
+
                 if "Подписка истекла" in old_content:
                     continue
-                
+
                 old_userinfo = ""
                 for line in old_content.split('\n'):
                     if line.startswith('#subscription-userinfo:'):
                         old_userinfo = line
                         break
-                
+
                 new_content = (old_userinfo + '\n' + template) if old_userinfo else template
                 repo.update_file(path, f"Синхронизация", new_content, existing_file.sha, branch=BRANCH)
                 results[sub_type] += 1
@@ -317,12 +316,10 @@ def get_all_subscriptions():
             expire_date = "не указана"
             is_expired = False
             is_stub = False
-            
+
             if content:
-                # Проверяем, заглушка ли это
                 if "Подписка истекла" in content:
                     is_stub = True
-                
                 for line in content.split('\n'):
                     if 'expire=' in line:
                         try:
@@ -332,7 +329,7 @@ def get_all_subscriptions():
                                 is_expired = True
                         except: pass
                         break
-            
+
             subs.append({
                 "type": sub_type,
                 "type_name": TEMPLATES[sub_type]["name"],
@@ -351,20 +348,19 @@ def get_all_subscriptions():
 def index():
     return redirect("https://olegmmg.github.io/")
 
-# Регистрация
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.json
     email = data.get('email', '').strip().lower()
     password = data.get('password', '')
-    
+
     if not email or not password or len(password) < 6:
         return jsonify({'success': False, 'error': 'Email и пароль (мин. 6 символов)'})
-    
+
     users = get_users()
     if email in users:
         return jsonify({'success': False, 'error': 'Email уже зарегистрирован'})
-    
+
     token = str(uuid.uuid4())
     users[email] = {
         'email': email,
@@ -372,83 +368,110 @@ def register():
         'token': token,
         'subscriptions': [],
         'orders': [],
+        'trial_used': False,
         'created_at': datetime.now().isoformat()
     }
     save_users(users)
-    
     return jsonify({'success': True, 'token': token, 'user': {'email': email}})
 
-# Вход
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.json
     email = data.get('email', '').strip().lower()
     password = data.get('password', '')
-    
+
     users = get_users()
     user = users.get(email)
-    
+
     if not user or user.get('password') != hash_password(password):
         return jsonify({'success': False, 'error': 'Неверный email или пароль'})
-    
+
     new_token = str(uuid.uuid4())
     user['token'] = new_token
     save_users(users)
-    
     return jsonify({'success': True, 'token': new_token, 'user': {'email': email}})
 
-# Проверка токена
 @app.route('/api/verify', methods=['POST'])
 def verify():
     data = request.json
     token = data.get('token')
-    
     users = get_users()
     for email, user in users.items():
         if user.get('token') == token:
             return jsonify({'valid': True, 'user': {'email': email}})
     return jsonify({'valid': False})
 
-# Мои подписки
 @app.route('/api/my-subscriptions', methods=['GET'])
 def my_subscriptions():
     auth = request.headers.get('Authorization', '')
     token = auth.replace('Bearer ', '')
-    
     email, user = get_user_by_token(token)
     if not user:
         return jsonify({'subscriptions': []})
-    
+
     subs = user.get('subscriptions', [])
-    # Обновляем статусы на основе реальных файлов
     now_ts = int(datetime.now().timestamp())
     for sub in subs:
         if sub.get('expire_ts', 0) < now_ts:
             sub['status'] = 'expired'
-            # Проверяем, прошло ли 7 дней
             if sub.get('expire_ts', 0) + (7 * 24 * 60 * 60) < now_ts:
                 sub['status'] = 'deleted'
         else:
             sub['status'] = 'active'
-    
+
     subs.sort(key=lambda x: x.get('expire_ts', 0), reverse=True)
     return jsonify({'subscriptions': subs})
 
-# Создание заявки на оплату
+@app.route('/api/can-take-trial', methods=['GET'])
+def can_take_trial():
+    auth = request.headers.get('Authorization', '')
+    token = auth.replace('Bearer ', '')
+    email, user = get_user_by_token(token)
+    if not user:
+        return jsonify({'can_take': False})
+    can = user_can_take_trial(email)
+    return jsonify({'can_take': can})
+
+@app.route('/api/activate-trial', methods=['POST'])
+def activate_trial():
+    auth = request.headers.get('Authorization', '')
+    token = auth.replace('Bearer ', '')
+    email, user = get_user_by_token(token)
+    if not user:
+        return jsonify({'success': False, 'error': 'Не авторизован'})
+
+    if not user_can_take_trial(email):
+        return jsonify({'success': False, 'error': 'Пробная подписка уже использована'})
+
+    data = request.json
+    sub_type = data.get('type', 'main')
+    if sub_type not in ['main', 'test']:
+        return jsonify({'success': False, 'error': 'Неверный тип подписки'})
+
+    url, msg = create_subscription(sub_type, '7d', email)
+    if url:
+        # Обновляем trial_used явно (на случай если create_subscription не сохранил)
+        users = get_users()
+        if email in users:
+            users[email]['trial_used'] = True
+            save_users(users)
+        return jsonify({'success': True, 'url': url, 'message': msg})
+    else:
+        return jsonify({'success': False, 'error': msg})
+
 @app.route('/api/create-order', methods=['POST'])
 def create_order():
     auth = request.headers.get('Authorization', '')
     token = auth.replace('Bearer ', '')
-    
     email, user = get_user_by_token(token)
     if not user:
         return jsonify({'success': False, 'error': 'Не авторизован'})
-    
+
     data = request.json
     code = data.get('code')
     if not code:
         return jsonify({'success': False, 'error': 'Нет кода'})
-    
+
     order = {
         'code': code,
         'user_email': email,
@@ -460,30 +483,26 @@ def create_order():
         'timestamp': datetime.now().isoformat(),
         'status': 'pending'
     }
-    
+
     if save_file(f"{ORDERS_DIR}/{code}.json", json.dumps(order, ensure_ascii=False, indent=2), f"Заявка #{code}"):
         if 'orders' not in user:
             user['orders'] = []
         user['orders'].append({'code': code, 'status': 'pending', 'created_at': order['timestamp']})
         save_users(get_users())
         return jsonify({'success': True, 'code': code})
-    
     return jsonify({'success': False, 'error': 'Ошибка сохранения'})
 
-# Прямое создание подписки (для админа)
 @app.route('/api/create', methods=['POST'])
 def api_create():
     data = request.json
     sub_type = data.get('type', 'main')
     duration = data.get('duration', '1m')
     user_email = data.get('user_email')
-    
     url, msg = create_subscription(sub_type, duration, user_email)
     if url:
         return jsonify({'success': True, 'url': url, 'message': msg})
     return jsonify({'success': False, 'error': msg})
 
-# Проверка истекших подписок (API для внешнего cron)
 @app.route('/api/check-expired', methods=['GET', 'POST'])
 def api_check_expired():
     results = check_expired_subscriptions()
@@ -495,12 +514,11 @@ def api_check_expired():
 def admin():
     if not repo:
         return "<h1>❌ GitHub не настроен</h1><p>Укажите GITHUB_TOKEN</p>"
-    
+
     all_subs = get_all_subscriptions()
     main_subs = [s for s in all_subs if s['type'] == 'main']
     test_subs = [s for s in all_subs if s['type'] == 'test']
-    
-    # Получаем заявки
+
     orders = []
     try:
         contents = repo.get_contents(ORDERS_DIR, ref=BRANCH)
@@ -511,19 +529,24 @@ def admin():
         orders.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
     except:
         pass
-    
-    # Получаем пользователей
+
     users = get_users()
-    users_list = [{'email': e, 'subscriptions_count': len(u.get('subscriptions', [])), 'created_at': u.get('created_at', '')} 
-                  for e, u in users.items()]
+    users_list = []
+    for e, u in users.items():
+        users_list.append({
+            'email': e,
+            'subscriptions_count': len(u.get('subscriptions', [])),
+            'created_at': u.get('created_at', ''),
+            'trial_used': u.get('trial_used', False) or any(s.get('duration') == '7d' for s in u.get('subscriptions', []))
+        })
     users_list.sort(key=lambda x: x['created_at'], reverse=True)
-    
+
     message = None
     message_type = None
-    
+
     if request.method == 'POST':
         action = request.form.get('action')
-        
+
         if action == 'create':
             sub_type = request.form.get('subscription_type')
             duration = request.form.get('duration')
@@ -537,7 +560,7 @@ def admin():
             else:
                 message = f"❌ {msg}"
                 message_type = 'error'
-        
+
         elif action == 'delete':
             delete_type = request.form.get('delete_type')
             filename = request.form.get('delete_file')
@@ -548,12 +571,12 @@ def admin():
             else:
                 message = "❌ Ошибка удаления"
                 message_type = 'error'
-        
+
         elif action == 'sync':
             results = sync_all_subscriptions()
             message = f"🔄 Синхронизация завершена!<br>📁 Основные: {results['main']}, Тестовые: {results['test']}"
             message_type = 'warning'
-        
+
         elif action == 'check_expired':
             results = check_expired_subscriptions()
             msg_parts = []
@@ -565,7 +588,7 @@ def admin():
                 msg_parts.append(f"✅ Всё актуально (проверено {results.get('skipped', 0)} подписок)")
             message = "<br><br>".join(msg_parts)
             message_type = 'success' if not results.get('error') else 'error'
-        
+
         elif action == 'confirm_order':
             code = request.form.get('order_code')
             path = f"{ORDERS_DIR}/{code}.json"
@@ -575,26 +598,11 @@ def admin():
                 user_email = order.get('user_email')
                 sub_type = order.get('type', 'main')
                 duration = order.get('duration', '1m')
-                is_trial = (duration == '7d')
-                
-                # Проверка для пробной подписки
-                if is_trial and user_email:
-                    users_check = get_users()
-                    user_check = users_check.get(user_email)
-                    if user_check:
-                        for sub in user_check.get('subscriptions', []):
-                            if sub.get('duration') == '7d' and sub.get('expire_ts', 0) > int(datetime.now().timestamp()):
-                                message = f"❌ Ошибка: пользователь уже использовал пробную подписку"
-                                message_type = 'error'
-                                delete_file(path)
-                                # Редирект чтобы обновить список
-                                return redirect('/admin')
-                
+
+                # Пробная подписка уже обрабатывается на фронте отдельно, но оставим проверку
                 url, msg = create_subscription(sub_type, duration, user_email)
-                
                 if url:
                     delete_file(path)
-                    
                     users_local = get_users()
                     if user_email in users_local:
                         for o in users_local[user_email].get('orders', []):
@@ -603,7 +611,6 @@ def admin():
                                 o['subscription_url'] = url
                                 break
                         save_users(users_local)
-                    
                     message = f"✅ Заявка {code} подтверждена!<br>📅 {msg}"
                     message_type = 'success'
                 else:
@@ -613,7 +620,7 @@ def admin():
             else:
                 message = "❌ Заявка не найдена"
                 message_type = 'error'
-        
+
         elif action == 'delete_order':
             code = request.form.get('order_code')
             path = f"{ORDERS_DIR}/{code}.json"
@@ -623,16 +630,15 @@ def admin():
             else:
                 message = "❌ Ошибка удаления"
                 message_type = 'error'
-        
-        # Перенаправляем чтобы обновить данные
+
         return redirect('/admin')
-    
-    return render_template_string(ADMIN_TEMPLATE, 
-                                  main_subs=main_subs, 
+
+    return render_template_string(ADMIN_TEMPLATE,
+                                  main_subs=main_subs,
                                   test_subs=test_subs,
                                   orders=orders,
                                   users=users_list,
-                                  message=message, 
+                                  message=message,
                                   message_type=message_type)
 
 # ========== ТЁМНАЯ АДМИН-ПАНЕЛЬ ==========
